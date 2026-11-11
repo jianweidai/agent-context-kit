@@ -118,5 +118,47 @@ class RobustnessTest(unittest.TestCase):
         self.assertEqual(timestamps['claude numeric timestamp'], '')
 
 
+    def test_invalid_records_are_reported_without_reindexing(self):
+        path = self.write('.claude/projects/demo/s.jsonl', encode(claude('first'), b'{bad\n', claude('second')))
+        self.assertEqual(self.sync()['rebuilt'], 1)
+        error = lambda: self.db.execute('SELECT error FROM sources').fetchone()[0]
+        self.assertIn('[2]', error())
+        ids = self.db.execute('SELECT group_concat(id) FROM messages').fetchone()[0]
+        result = self.sync()
+        self.assertEqual((result['unchanged'], result['rebuilt']), (1, 0))
+        self.assertIn('[2]', error())
+        with path.open('ab') as f:
+            f.write(encode(claude('third'), b'[also bad\n'))
+        result = self.sync()
+        self.assertEqual((result['appended'], result['messages_added']), (1, 1))
+        self.assertIn('[2, 5]', error())
+        self.assertTrue(self.db.execute('SELECT group_concat(id) FROM messages').fetchone()[0].startswith(ids))
+        self.assertEqual(self.texts(), ['first', 'second', 'third'])
+        self.assertEqual(self.sync()['unchanged'], 1)
+        path.write_bytes(encode(claude('fixed')))
+        self.assertEqual(self.sync()['rebuilt'], 1)
+        self.assertEqual((error(), self.texts()), ('', ['fixed']))
+
+    def test_read_failures_are_retried(self):
+        path = self.write('.codex/archived_sessions/r.jsonl.zst', b'not zstd')
+        self.assertEqual(self.sync()['failed'], 1)
+        self.assertEqual(self.sync()['failed'], 1)
+        import zstandard
+        path.write_bytes(zstandard.ZstdCompressor().compress(encode(
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
+                                                  'content': [{'type': 'input_text', 'text': 'recovered'}]}})))
+        self.assertEqual(self.sync()['rebuilt'], 1)
+        self.assertEqual(self.texts(), ['recovered'])
+
+    def test_index_without_bad_lines_column_is_upgraded(self):
+        self.write('.claude/projects/demo/s.jsonl', encode(claude('kept'), b'{bad\n'))
+        self.sync()
+        self.db.execute('ALTER TABLE sources DROP COLUMN bad_lines')
+        self.db.close()
+        self.db = module.connect(self.root)
+        self.assertEqual(self.sync()['rebuilt'], 1)
+        self.assertEqual(self.sync()['unchanged'], 1)
+        self.assertEqual(self.texts(), ['kept'])
+
 if __name__ == '__main__':
     unittest.main()

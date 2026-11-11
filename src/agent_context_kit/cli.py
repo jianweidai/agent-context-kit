@@ -43,7 +43,7 @@ def connect(root):
       project TEXT DEFAULT '', title TEXT DEFAULT '', size INTEGER DEFAULT 0,
       mtime INTEGER DEFAULT 0, offset INTEGER DEFAULT 0, lines INTEGER DEFAULT 0,
       digest TEXT DEFAULT '', available INTEGER DEFAULT 1, error TEXT DEFAULT '',
-      synced_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+      synced_at TEXT DEFAULT '', updated_at TEXT DEFAULT '', bad_lines TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY, source_id TEXT, line INTEGER, role TEXT,
       timestamp TEXT, text TEXT, UNIQUE(source_id,line));
@@ -55,6 +55,13 @@ def connect(root):
     CREATE TRIGGER IF NOT EXISTS message_delete AFTER DELETE ON messages BEGIN
       INSERT INTO search(search,rowid,text) VALUES('delete',old.id,old.text); END;
     ''')
+    # Indexes created before bad_lines existed; their errored sources are retried once.
+    if 'bad_lines' not in {r['name'] for r in db.execute('PRAGMA table_info(sources)')}:
+        try:
+            db.execute("ALTER TABLE sources ADD COLUMN bad_lines TEXT DEFAULT ''")
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column' not in str(exc):
+                raise
     return db
 
 
@@ -173,8 +180,10 @@ def sync_one(db, root, provider, path):
     stat = path.stat()
     row = db.execute('SELECT * FROM sources WHERE id=?', (sid,)).fetchone()
     compressed = path.suffix in ('.zst', '.zstd')
+    # Invalid records are reported but stable; only read/decode failures (no bad_lines) are retried.
+    retry = bool(row and row['error'] and not row['bad_lines'])
     link(root / 'sources' / provider / (sid + ('.jsonl' + path.suffix if compressed else '.jsonl')), path)
-    if row and row['size'] == stat.st_size and row['mtime'] == stat.st_mtime_ns and not row['error']:
+    if row and row['size'] == stat.st_size and row['mtime'] == stat.st_mtime_ns and not retry:
         db.execute('UPDATE sources SET available=1 WHERE id=?', (sid,))
         return 'unchanged', 0
     db.execute('INSERT OR IGNORE INTO sources(id,provider,path,native_id) VALUES(?,?,?,?)',
@@ -184,7 +193,7 @@ def sync_one(db, root, provider, path):
         with stream(path) as f:
             digest = hashlib.sha256()
             offset, line_no, append = 0, 0, False
-            if row and not row['error'] and not compressed and row['offset'] <= stat.st_size:
+            if row and not retry and not compressed and row['offset'] <= stat.st_size:
                 remaining = row['offset']
                 while remaining:
                     chunk = f.read(min(1024 * 1024, remaining))
@@ -196,14 +205,15 @@ def sync_one(db, root, provider, path):
             if append:
                 offset, line_no = row['offset'], row['lines']
                 meta = dict(row)
+                bad_lines = json.loads(row['bad_lines'] or '[]')
             else:
                 if not compressed:
                     f.seek(0)
                 digest = hashlib.sha256()
                 db.execute('DELETE FROM messages WHERE source_id=?', (sid,))
                 meta = {'native_id': path.name, 'project': '', 'title': '', 'updated_at': ''}
+                bad_lines = []
             count = 0
-            bad_lines = []
             # Freeze the initial file size; leave partial JSON lines for the next sync.
             while compressed or offset < stat.st_size:
                 raw = f.readline() if compressed else f.readline(stat.st_size - offset)
@@ -236,15 +246,17 @@ def sync_one(db, root, provider, path):
                         meta['title'] = body.replace('\n', ' ')[:160]
             error = ('Invalid records at lines: ' + str(bad_lines[:20])) if bad_lines else ''
             db.execute('''UPDATE sources SET native_id=?,project=?,title=?,size=?,mtime=?,offset=?,
-                       lines=?,digest=?,available=1,error=?,synced_at=?,updated_at=? WHERE id=?''',
+                       lines=?,digest=?,available=1,error=?,bad_lines=?,synced_at=?,updated_at=? WHERE id=?''',
                        (meta['native_id'], meta['project'], meta['title'], stat.st_size, stat.st_mtime_ns,
-                        offset, line_no, digest.hexdigest(), error, now(), meta['updated_at'], sid))
+                        offset, line_no, digest.hexdigest(), error, json.dumps(bad_lines[:20]) if bad_lines else '',
+                        now(), meta['updated_at'], sid))
         db.execute('RELEASE source_sync')
         return ('appended' if append else 'rebuilt'), count
     except Exception as exc:
         db.execute('ROLLBACK TO source_sync')
         db.execute('RELEASE source_sync')
-        db.execute('UPDATE sources SET available=1,error=? WHERE id=?', (type(exc).__name__ + ': ' + str(exc), sid))
+        db.execute("UPDATE sources SET available=1,error=?,bad_lines='' WHERE id=?",
+                   (type(exc).__name__ + ': ' + str(exc), sid))
         return 'failed', 0
 
 
