@@ -14,12 +14,14 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import time
 
 
 SCHEMA_VERSION = 1  # 1: message text is redacted on insert.
 COMMON_CANDIDATES = 2000  # trigram candidates beyond which search walks messages by time instead
 SHORT_QUERY_WINDOW = 20000  # newest messages tried first for queries shorter than a trigram
 MAX_SPELLINGS = 16  # trigram phrases tried for case variants the tokenizer does not fold
+TAIL_SETTLE_SECONDS = 600  # an unterminated last line is indexed once the file has been idle this long
 
 # (kind, pattern, check): conservative token shapes; `check` rejects look-alikes such as kebab-case names.
 SECRETS = [
@@ -277,7 +279,11 @@ def sync_one(db, root, provider, path, redact_secrets=True):
     # Invalid records are reported but stable; only read/decode failures (no bad_lines) are retried.
     retry = bool(row and row['error'] and not row['bad_lines'])
     link(source_link(root, provider, sid, path), path)
-    if row and row['size'] == stat.st_size and row['mtime'] == stat.st_mtime_ns and not retry:
+    # Writers end every record with a newline, so an unterminated last line is normally still being
+    # written. Compressed files are complete; plain files are trusted once they stop changing.
+    settled = time.time() - stat.st_mtime >= TAIL_SETTLE_SECONDS
+    pending_tail = bool(row and not compressed and settled and row['offset'] < stat.st_size)
+    if row and row['size'] == stat.st_size and row['mtime'] == stat.st_mtime_ns and not retry and not pending_tail:
         db.execute('UPDATE sources SET available=1 WHERE id=?', (sid,))
         return 'unchanged', 0
     db.execute('INSERT OR IGNORE INTO sources(id,provider,path,native_id) VALUES(?,?,?,?)',
@@ -286,18 +292,28 @@ def sync_one(db, root, provider, path, redact_secrets=True):
     try:
         with stream(path) as f:
             digest = hashlib.sha256()
-            offset, line_no, append = 0, 0, False
+            offset, line_no, append, skip = 0, 0, False, 0
             if row and not retry and not compressed and row['offset'] <= stat.st_size:
-                remaining = row['offset']
+                remaining, last = row['offset'], b'\n'
                 while remaining:
                     chunk = f.read(min(1024 * 1024, remaining))
                     if not chunk:
                         break
                     digest.update(chunk)
                     remaining -= len(chunk)
+                    last = chunk[-1:]
                 append = remaining == 0 and digest.hexdigest() == row['digest']
+                if append and last != b'\n':
+                    # The last indexed line had no newline. If one now ends it, the line is unchanged and
+                    # appending continues; if the writer continued that line instead, reindex the file.
+                    following = f.read(1)
+                    if following == b'\n':
+                        digest.update(following)
+                        skip = 1
+                    elif following:
+                        append = False
             if append:
-                offset, line_no = row['offset'], row['lines']
+                offset, line_no = row['offset'] + skip, row['lines']
                 meta = dict(row)
                 bad_lines = json.loads(row['bad_lines'] or '[]')
             else:
@@ -308,12 +324,12 @@ def sync_one(db, root, provider, path, redact_secrets=True):
                 meta = {'native_id': path.name, 'project': '', 'title': '', 'updated_at': ''}
                 bad_lines = []
             count = 0
-            # Freeze the initial file size; leave partial JSON lines for the next sync.
+            # Freeze the initial file size; leave a partial last line for the next sync unless settled.
             while compressed or offset < stat.st_size:
                 raw = f.readline() if compressed else f.readline(stat.st_size - offset)
                 if not raw:
                     break
-                if not raw.endswith(b'\n'):
+                if not raw.endswith(b'\n') and not (compressed or settled):
                     break
                 digest.update(raw)
                 offset += len(raw)
