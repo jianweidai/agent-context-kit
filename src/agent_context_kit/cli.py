@@ -36,6 +36,8 @@ def connect(root):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = sqlite3.connect(root / 'index.sqlite', timeout=60)
     db.row_factory = sqlite3.Row
+    # Deleted messages must not linger in freed pages (see purge/prune).
+    db.execute('PRAGMA secure_delete=ON')
     db.execute('PRAGMA journal_mode=WAL')
     db.executescript('''
     CREATE TABLE IF NOT EXISTS sources (
@@ -175,6 +177,11 @@ def map_memories(home, root):
     return len(mappings)
 
 
+def source_link(root, provider, sid, path):
+    compressed = Path(path).suffix in ('.zst', '.zstd')
+    return root / 'sources' / provider / (sid + ('.jsonl' + Path(path).suffix if compressed else '.jsonl'))
+
+
 def sync_one(db, root, provider, path):
     sid = provider + '-' + hashlib.sha256(str(path).encode()).hexdigest()[:20]
     stat = path.stat()
@@ -182,7 +189,7 @@ def sync_one(db, root, provider, path):
     compressed = path.suffix in ('.zst', '.zstd')
     # Invalid records are reported but stable; only read/decode failures (no bad_lines) are retried.
     retry = bool(row and row['error'] and not row['bad_lines'])
-    link(root / 'sources' / provider / (sid + ('.jsonl' + path.suffix if compressed else '.jsonl')), path)
+    link(source_link(root, provider, sid, path), path)
     if row and row['size'] == stat.st_size and row['mtime'] == stat.st_mtime_ns and not retry:
         db.execute('UPDATE sources SET available=1 WHERE id=?', (sid,))
         return 'unchanged', 0
@@ -260,28 +267,84 @@ def sync_one(db, root, provider, path):
         return 'failed', 0
 
 
-def sync(db, root, home):
-    counts = {'unchanged': 0, 'appended': 0, 'rebuilt': 0, 'updated': 0, 'failed': 0, 'messages_added': 0}
+@contextlib.contextmanager
+def sync_lock(root):
     with (root / 'sync.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        found = set()
-        for provider, path in discover(home):
-            found.add(str(path))
-            with db:
-                kind, added = sync_one(db, root, provider, path)
-            counts[kind] += 1
-            counts['messages_added'] += added
+        yield
+
+
+def checkpoint(db, wait_ms):
+    """Copy the WAL into the database and truncate it, so removed text leaves the -wal file too."""
+    db.execute(f'PRAGMA busy_timeout={int(wait_ms)}')
+    try:
+        return db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
+    finally:
+        db.execute('PRAGMA busy_timeout=60000')
+
+
+def purge(db, root, found):
+    """Remove indexed text and links of sources whose files are gone; keep the row for `read` errors."""
+    removed = 0
+    for row in db.execute('SELECT id,provider,path,available FROM sources').fetchall():
+        if row['path'] in found:
+            continue
+        stale_link = source_link(root, row['provider'], row['id'], row['path'])
+        if stale_link.is_symlink():
+            stale_link.unlink()
+        has_text = db.execute('SELECT 1 FROM messages WHERE source_id=? LIMIT 1', (row['id'],)).fetchone()
+        if row['available'] or has_text:
+            db.execute('DELETE FROM messages WHERE source_id=?', (row['id'],))
+            # Reset sync state so a file that reappears at this path is indexed again.
+            db.execute('''UPDATE sources SET available=0,title='',size=-1,mtime=0,offset=0,lines=0,
+                       digest='',bad_lines='' WHERE id=?''', (row['id'],))
+            removed += 1
+    for old in (root / 'sources').rglob('*') if (root / 'sources').is_dir() else ():
+        if old.is_symlink() and not old.exists():
+            old.unlink()
+    return removed
+
+
+def _sync(db, root, home):
+    counts = {'unchanged': 0, 'appended': 0, 'rebuilt': 0, 'updated': 0, 'failed': 0, 'messages_added': 0}
+    found = set()
+    for provider, path in discover(home):
+        found.add(str(path))
         with db:
-            for row in db.execute('SELECT id,path FROM sources').fetchall():
-                if row['path'] not in found:
-                    db.execute('UPDATE sources SET available=0 WHERE id=?', (row['id'],))
-        counts['memory_mappings'] = map_memories(home, root)
-        catalog = root / 'catalog.jsonl.tmp'
-        with catalog.open('w') as f:
-            for row in db.execute('SELECT id,provider,native_id,project,title,path,available,error,updated_at FROM sources ORDER BY updated_at DESC,id'):
-                f.write(json.dumps(dict(row), ensure_ascii=False) + '\n')
-        catalog.replace(root / 'catalog.jsonl')
-        (root / 'last-sync.json').write_text(json.dumps({'at': now(), **counts}, indent=2) + '\n')
+            kind, added = sync_one(db, root, provider, path)
+        counts[kind] += 1
+        counts['messages_added'] += added
+    with db:
+        counts['removed'] = purge(db, root, found)
+    if counts['removed']:
+        checkpoint(db, 1000)
+    counts['memory_mappings'] = map_memories(home, root)
+    catalog = root / 'catalog.jsonl.tmp'
+    with catalog.open('w') as f:
+        for row in db.execute('SELECT id,provider,native_id,project,title,path,available,error,updated_at FROM sources ORDER BY updated_at DESC,id'):
+            f.write(json.dumps(dict(row), ensure_ascii=False) + '\n')
+    catalog.replace(root / 'catalog.jsonl')
+    (root / 'last-sync.json').write_text(json.dumps({'at': now(), **counts}, indent=2) + '\n')
+    return counts
+
+
+def sync(db, root, home):
+    with sync_lock(root):
+        return _sync(db, root, home)
+
+
+def prune(db, root, home, rebuild=False):
+    """Sync, forget missing sources entirely, then compact the index and WAL."""
+    with sync_lock(root):
+        if rebuild:
+            with db:
+                db.execute("UPDATE sources SET size=-1,mtime=0,offset=0,lines=0,digest='',bad_lines=''")
+        counts = _sync(db, root, home)
+        with db:
+            counts['forgotten'] = db.execute('DELETE FROM sources WHERE available=0').rowcount
+            db.execute("INSERT INTO search(search) VALUES('optimize')")
+        db.execute('VACUUM')
+        counts['checkpointed'] = checkpoint(db, 60000)
     return counts
 
 
@@ -303,6 +366,8 @@ def main():
     parser.add_argument('--no-sync', action='store_true', help='Read the existing index without refreshing')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('sync')
+    p = sub.add_parser('prune', help='Forget deleted sources, then compact the index (FTS optimize, VACUUM)')
+    p.add_argument('--rebuild', action='store_true', help='Reindex every source from scratch')
     sub.add_parser('status')
     for name in ['list', 'search']:
         p = sub.add_parser(name)
@@ -330,6 +395,10 @@ def main():
     db = connect(root)
     if args.command == 'sync':
         result = sync(db, root, home)
+        output(result)
+        return 1 if result['failed'] else 0
+    if args.command == 'prune':
+        result = prune(db, root, home, args.rebuild)
         output(result)
         return 1 if result['failed'] else 0
     if not args.no_sync:
