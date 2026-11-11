@@ -9,4 +9,4 @@ Read nearby evidence with `agent-context read ID --start-line N --limit 10`. Cit
 
 Use `agent-context memory --query TERM` to find relevant Markdown notes. Save a new scoped note under `~/.agent-context-kit/memory/shared/` only when the user explicitly asks to remember something. Imported memory directories point to original client files.
 
-Queries refresh the index. Use `agent-context --no-sync status` for the last snapshot, including any source errors. Read only task-relevant material into the current model's context. Duplicate native IDs can represent migrated logs.
+Queries refresh the index; `"stale": true` means another sync was running, so very recent turns may be missing until a later query. Use `agent-context --no-sync status` for the last snapshot, including any source errors. Read only task-relevant material into the current model's context. Duplicate native IDs can represent migrated logs.

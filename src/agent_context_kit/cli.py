@@ -307,10 +307,15 @@ def sync_one(db, root, provider, path, redact_secrets=True):
 
 
 @contextlib.contextmanager
-def sync_lock(root):
+def sync_lock(root, blocking=True):
+    """Yield whether the lock is held; with blocking=False, an ongoing sync is not waited for."""
     with (root / 'sync.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def checkpoint(db, wait_ms):
@@ -368,14 +373,15 @@ def _sync(db, root, home, redact_secrets=True):
     return counts
 
 
-def sync(db, root, home, redact_secrets=True):
-    with sync_lock(root):
-        return _sync(db, root, home, redact_secrets)
+def sync(db, root, home, redact_secrets=True, blocking=True):
+    """Return sync counts, or None when blocking=False and another process is syncing."""
+    with sync_lock(root, blocking) as locked:
+        return _sync(db, root, home, redact_secrets) if locked else None
 
 
 def prune(db, root, home, rebuild=False, redact_secrets=True):
     """Sync, forget missing sources entirely, then compact the index and WAL."""
-    with sync_lock(root):
+    with sync_lock(root, True):
         if rebuild:
             with db:
                 db.execute("UPDATE sources SET size=-1,mtime=0,offset=0,lines=0,digest='',bad_lines=''")
@@ -444,10 +450,18 @@ def main():
         result = prune(db, root, home, args.rebuild, redact_secrets)
         output(result)
         return 1 if result['failed'] else 0
+    extra = {}
     if not args.no_sync:
-        sync(db, root, home, redact_secrets)
+        # Queries do not wait for another process's sync, except before the first sync completed.
+        first = not (root / 'last-sync.json').exists()
+        if sync(db, root, home, redact_secrets, blocking=first) is None:
+            extra = {'stale': True, 'stale_reason': 'Another sync is running; results come from the last completed '
+                                                    'snapshot. Retry later for newer messages.'}
+
+    def emit(value):
+        output({**value, **extra})
     if args.command == 'status':
-        output({'root': str(root), 'sources': [dict(r) for r in db.execute('''SELECT provider,
+        emit({'root': str(root), 'sources': [dict(r) for r in db.execute('''SELECT provider,
           available, count(*) count, sum(error!='') errors FROM sources GROUP BY provider,available''')],
           'indexed_messages': db.execute('SELECT count(*) FROM messages').fetchone()[0],
           'sources_without_indexed_text': db.execute('''SELECT count(*) FROM sources s
@@ -459,7 +473,7 @@ def main():
         rows = db.execute('SELECT s.*, (SELECT count(*) FROM messages m WHERE m.source_id=s.id) indexed_messages FROM sources s WHERE ' + ' AND '.join(where) +
                           ' ORDER BY updated_at DESC,id LIMIT ? OFFSET ?', values + [args.limit, args.offset]).fetchall()
         total = db.execute('SELECT count(*) FROM sources s WHERE ' + ' AND '.join(where), values).fetchone()[0]
-        output({'total': total, 'next_offset': args.offset + len(rows) if args.offset + len(rows) < total else None,
+        emit({'total': total, 'next_offset': args.offset + len(rows) if args.offset + len(rows) < total else None,
                 'sessions': [dict(r) for r in rows]})
     elif args.command == 'search':
         where, values = filters(args)
@@ -481,7 +495,7 @@ def main():
             pos = text.lower().find(args.query.lower())
             item['snippet'] = text[max(0, pos - 150):pos + len(args.query) + 350]
             results.append(item)
-        output({'results': results, 'next_offset': args.offset + args.limit if len(rows) > args.limit else None})
+        emit({'results': results, 'next_offset': args.offset + args.limit if len(rows) > args.limit else None})
     elif args.command == 'read':
         source = db.execute('SELECT * FROM sources WHERE id=?', (args.id,)).fetchone()
         if not source:
@@ -509,7 +523,7 @@ def main():
             item['text'] = item['text'][:budget]
             budget -= len(item['text'])
             selected.append(item)
-        output({'source': dict(source),
+        emit({'source': dict(source),
                 'coordinate': 'JSONL line',
                 'messages': selected, 'next_line': next_line,
                 'hint': 'For a truncated message, reread its line with a larger --max-chars.'})
@@ -525,7 +539,7 @@ def main():
                     found.append({'path': str(path), 'source': str(path.resolve()),
                                   'kind': 'shared' if base.name == 'shared' else 'imported',
                                   'preview': body[:200]})
-        output({'total': len(found), 'files': found[args.offset:args.offset + args.limit],
+        emit({'total': len(found), 'files': found[args.offset:args.offset + args.limit],
                 'next_offset': args.offset + args.limit if args.offset + args.limit < len(found) else None})
     db.close()
     return 0
