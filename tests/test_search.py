@@ -48,7 +48,7 @@ class SearchStrategyTest(unittest.TestCase):
         cls.temp.cleanup()
 
     def expected(self, query, limit, offset, project=None):
-        hits = [r for r in self.rows if query.lower() in r['text'].lower()
+        hits = [r for r in self.rows if module.fold(query) in module.fold(r['text'])
                 and (project is None or project in r['project'])]
         hits.sort(key=lambda r: (r['timestamp'], r['mid']), reverse=True)
         page = hits[offset:offset + limit]

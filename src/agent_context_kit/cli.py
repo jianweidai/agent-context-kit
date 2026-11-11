@@ -4,8 +4,10 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import functools
 import hashlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ import sys
 SCHEMA_VERSION = 1  # 1: message text is redacted on insert.
 COMMON_CANDIDATES = 2000  # trigram candidates beyond which search walks messages by time instead
 SHORT_QUERY_WINDOW = 20000  # newest messages tried first for queries shorter than a trigram
+MAX_SPELLINGS = 16  # trigram phrases tried for case variants the tokenizer does not fold
 
 # (kind, pattern, check): conservative token shapes; `check` rejects look-alikes such as kebab-case names.
 SECRETS = [
@@ -43,6 +46,51 @@ def redact(text):
     return text
 
 
+def fold_char(c):
+    folded = c.casefold()
+    if len(folded) == 1:
+        return folded
+    lower = c.lower()
+    return lower if len(lower) == 1 else c
+
+
+def fold(text):
+    """Unicode case folding that keeps one character per character (ß stays ß), so offsets carry over."""
+    if not isinstance(text, str):
+        return text
+    folded = text.casefold()
+    return folded if len(folded) == len(text) else ''.join(map(fold_char, text))
+
+
+def caseless(c):
+    return c.upper() == c == c.lower()
+
+
+# The only non-ASCII characters that fold to ASCII letters: KELVIN SIGN -> k, LONG S -> s.
+ASCII_FOLDS = {'k': '\u212a', 's': '\u017f'}
+
+
+@functools.lru_cache(maxsize=None)
+def case_tables():
+    """Map each folded character to all characters folding to it, and to the subset of those that this
+    SQLite's trigram tokenizer does not fold to it (its Unicode tables can be older than Python's), e.g.
+    CYRILLIC SMALL LETTER ROUNDED VE for в."""
+    pairs = [(c, fold_char(c)) for c in map(chr, range(0x110000))
+             if not 0xD800 <= ord(c) <= 0xDFFF and fold_char(c) != c]
+    db = sqlite3.connect(':memory:')
+    db.execute("CREATE VIRTUAL TABLE t USING fts5(text, tokenize='trigram')")
+    db.executemany('INSERT INTO t(rowid,text) VALUES(?,?)', ((i, '#' + c + '#') for i, (c, _) in enumerate(pairs)))
+    found = {r[0] for f in {f for _, f in pairs} for r in db.execute('SELECT rowid FROM t WHERE t MATCH ?',
+                                                                    ('"#' + f.replace('"', '""') + '#"',))}
+    db.close()
+    classes, unfolded = {}, {}
+    for i, (c, f) in enumerate(pairs):
+        classes.setdefault(f, [f]).append(c)
+        if i not in found:
+            unfolded.setdefault(f, []).append(c)
+    return {f: tuple(v) for f, v in classes.items()}, {f: tuple(v) for f, v in unfolded.items()}
+
+
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -66,6 +114,7 @@ def connect(root):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = sqlite3.connect(root / 'index.sqlite', timeout=60)
     db.row_factory = sqlite3.Row
+    db.create_function('fold', 1, fold, deterministic=True)
     # Deleted messages must not linger in freed pages (see purge/prune).
     db.execute('PRAGMA secure_delete=ON')
     db.execute('PRAGMA journal_mode=WAL')
@@ -480,8 +529,23 @@ def main():
                 'sessions': [dict(r) for r in rows]})
     elif args.command == 'search':
         where, values = filters(args)
-        where.append('instr(lower(m.text),lower(?))>0')
-        values.append(args.query)
+        query = fold(args.query)
+        # Matching is instr(fold(text), fold(query)). When every query character is ASCII or caseless (CJK,
+        # digits, punctuation), SQLite's ASCII-only lower() gives the same answer without calling Python,
+        # except for text holding one of the two non-ASCII characters that fold to an ASCII letter.
+        simple = all(c.isascii() or caseless(c) for c in query)
+        if simple:
+            exotic = [ASCII_FOLDS[c] for c in sorted(set(query) & ASCII_FOLDS.keys())]
+            fallback = ' OR (({}) AND instr(fold(m.text),?)>0)'.format(
+                ' OR '.join(['instr(m.text,?)>0'] * len(exotic))) if exotic else ''
+            where.append('(instr(lower(m.text),?)>0' + fallback + ')')
+            values += [query] + (exotic + [query] if exotic else [])
+        else:
+            # Exact prefilter: the text must contain some case variant of the first cased character.
+            key = next(c for c in query if not (c.isascii() or caseless(c)))
+            variants = case_tables()[0].get(key, (key,))
+            where.append('(' + ' OR '.join(['instr(m.text,?)>0'] * len(variants)) + ') AND instr(fold(m.text),?)>0')
+            values += list(variants) + [query]
 
         def run(messages, before=(), terms=(), after=()):
             return db.execute('''SELECT s.id,s.provider,s.native_id,s.project,s.path,s.available,s.error,
@@ -492,14 +556,22 @@ def main():
         # Common terms walk messages newest first and stop after offset+limit+1 matches; rare terms sort
         # only their candidates instead of scanning the whole table.
         need = args.offset + args.limit + 1
-        if len(args.query) >= 3:
-            # LIKE accelerates >=3-character substrings with the trigram index. Wildcards (%, _) only widen
-            # the candidate set and LIKE has no default escape character; instr ensures literal semantics.
-            like, cap = '%' + args.query + '%', COMMON_CANDIDATES + 10 * need
-            if db.execute('SELECT count(*) FROM (SELECT 1 FROM search WHERE text LIKE ? LIMIT ?)',
-                          (like, cap)).fetchone()[0] < cap:
-                rows = run('messages m JOIN', terms=['m.id IN (SELECT rowid FROM search WHERE text LIKE ?)'],
-                           after=[like])
+        # A trigram phrase is a literal substring (%, _ and \\ included) whose case folding agrees with fold()
+        # except for a few characters the tokenizer does not know; those are spelled out as extra phrases, so
+        # the candidates are a superset of the matches and the instr() terms decide.
+        options = [(c,) + (case_tables()[1].get(c, ()) if not simple and len(query) >= 3 else ()) for c in query]
+        spellings = 1
+        for option in options:
+            spellings *= len(option)
+        if len(query) >= 3 and spellings > MAX_SPELLINGS:
+            rows = run('messages m INDEXED BY messages_time CROSS JOIN')
+        elif len(query) >= 3:
+            phrase = ' OR '.join('"' + ''.join(p).replace('"', '""') + '"' for p in itertools.product(*options))
+            cap = COMMON_CANDIDATES + 10 * need
+            if db.execute('SELECT count(*) FROM (SELECT 1 FROM search WHERE search MATCH ? LIMIT ?)',
+                          (phrase, cap)).fetchone()[0] < cap:
+                rows = run('messages m JOIN', terms=['m.id IN (SELECT rowid FROM search WHERE search MATCH ?)'],
+                           after=[phrase])
             else:
                 rows = run('messages m INDEXED BY messages_time CROSS JOIN')
         else:
@@ -514,8 +586,8 @@ def main():
         for row in rows[:args.limit]:
             item = dict(row)
             text = item.pop('text')
-            pos = text.lower().find(args.query.lower())
-            item['snippet'] = text[max(0, pos - 150):pos + len(args.query) + 350]
+            pos = max(0, fold(text).find(query))  # fold() keeps offsets
+            item['snippet'] = text[max(0, pos - 150):pos + len(query) + 350]
             results.append(item)
         emit({'results': results, 'next_offset': args.offset + args.limit if len(rows) > args.limit else None})
     elif args.command == 'read':

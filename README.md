@@ -23,7 +23,7 @@ agent-context read SOURCE_ID --start-line 12 --limit 5
 agent-context memory --query 'style'
 ```
 
-Search matches literal substrings, including Chinese and code identifiers. Results carry the source ID and original line number. Use `--raw` to inspect tool records at the source. Look at `next_offset` to page through list/search/memory results.
+Search matches literal substrings, including Chinese and code identifiers, ignoring case across scripts (Unicode case folding that maps one character to one character, so `ß` matches `ẞ` but not `ss`). Results carry the source ID and original line number. Use `--raw` to inspect tool records at the source. Look at `next_offset` to page through list/search/memory results.
 
 ## Storage
 

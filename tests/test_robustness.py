@@ -59,7 +59,7 @@ class RobustnessTest(unittest.TestCase):
         with mock.patch.object(module, 'connect', traced), mock.patch.object(sys, 'argv', argv), \
                 contextlib.redirect_stdout(out):
             self.assertEqual(module.main(), 0)
-        used_index = any('FROM search WHERE text LIKE' in s for s in statements)
+        used_index = any('FROM search WHERE search MATCH' in s for s in statements)
         return [r['snippet'] for r in json.loads(out.getvalue())['results']], used_index
 
     def test_wildcard_characters_use_index_and_stay_literal(self):
