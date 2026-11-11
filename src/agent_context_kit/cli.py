@@ -15,6 +15,8 @@ import sys
 
 
 SCHEMA_VERSION = 1  # 1: message text is redacted on insert.
+COMMON_CANDIDATES = 2000  # trigram candidates beyond which search walks messages by time instead
+SHORT_QUERY_WINDOW = 20000  # newest messages tried first for queries shorter than a trigram
 
 # (kind, pattern, check): conservative token shapes; `check` rejects look-alikes such as kebab-case names.
 SECRETS = [
@@ -79,6 +81,7 @@ def connect(root):
       id INTEGER PRIMARY KEY, source_id TEXT, line INTEGER, role TEXT,
       timestamp TEXT, text TEXT, UNIQUE(source_id,line));
     CREATE INDEX IF NOT EXISTS messages_source ON messages(source_id,line);
+    CREATE INDEX IF NOT EXISTS messages_time ON messages(timestamp);
     CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(text, content='messages',
       content_rowid='id', tokenize='trigram');
     CREATE TRIGGER IF NOT EXISTS message_insert AFTER INSERT ON messages BEGIN
@@ -477,17 +480,36 @@ def main():
                 'sessions': [dict(r) for r in rows]})
     elif args.command == 'search':
         where, values = filters(args)
-        # LIKE accelerates >=3-character substrings with the trigram index. Wildcards (%, _) only widen
-        # the candidate set and LIKE has no default escape character; instr ensures literal semantics.
-        if len(args.query) >= 3:
-            where.append('m.id IN (SELECT rowid FROM search WHERE text LIKE ?)')
-            values.append('%' + args.query + '%')
         where.append('instr(lower(m.text),lower(?))>0')
         values.append(args.query)
-        rows = db.execute('''SELECT s.id,s.provider,s.native_id,s.project,s.path,s.available,s.error,
-             m.line,m.role,m.timestamp,m.text FROM messages m JOIN sources s ON s.id=m.source_id WHERE ''' +
-             ' AND '.join(where) + ' ORDER BY m.timestamp DESC,m.id DESC LIMIT ? OFFSET ?',
-             values + [args.limit + 1, args.offset]).fetchall()
+
+        def run(messages, before=(), terms=(), after=()):
+            return db.execute('''SELECT s.id,s.provider,s.native_id,s.project,s.path,s.available,s.error,
+             m.line,m.role,m.timestamp,m.text FROM ''' + messages + ''' sources s ON s.id=m.source_id WHERE ''' +
+             ' AND '.join(where + list(terms)) + ' ORDER BY m.timestamp DESC,m.id DESC LIMIT ? OFFSET ?',
+             [*before, *values, *after, args.limit + 1, args.offset]).fetchall()
+        # Every strategy returns the same rows in the same order (newest first, then highest id).
+        # Common terms walk messages newest first and stop after offset+limit+1 matches; rare terms sort
+        # only their candidates instead of scanning the whole table.
+        need = args.offset + args.limit + 1
+        if len(args.query) >= 3:
+            # LIKE accelerates >=3-character substrings with the trigram index. Wildcards (%, _) only widen
+            # the candidate set and LIKE has no default escape character; instr ensures literal semantics.
+            like, cap = '%' + args.query + '%', COMMON_CANDIDATES + 10 * need
+            if db.execute('SELECT count(*) FROM (SELECT 1 FROM search WHERE text LIKE ? LIMIT ?)',
+                          (like, cap)).fetchone()[0] < cap:
+                rows = run('messages m JOIN', terms=['m.id IN (SELECT rowid FROM search WHERE text LIKE ?)'],
+                           after=[like])
+            else:
+                rows = run('messages m INDEXED BY messages_time CROSS JOIN')
+        else:
+            # Shorter queries cannot use trigrams: if enough of the newest messages match, those are the
+            # answer; otherwise scan everything.
+            rows = run('''(SELECT * FROM messages INDEXED BY messages_time ORDER BY timestamp DESC,id DESC
+                       LIMIT ?) m CROSS JOIN''', before=[SHORT_QUERY_WINDOW + 10 * need])
+            if len(rows) <= args.limit:
+                # A plain scan plus sort beats walking the whole time index for rare matches.
+                rows = run('messages m NOT INDEXED JOIN')
         results = []
         for row in rows[:args.limit]:
             item = dict(row)
