@@ -78,6 +78,45 @@ class RobustnessTest(unittest.TestCase):
         self.assertFalse(used_index)
         self.assertEqual(len(snippets), 0)
 
+    def test_bad_records_do_not_drop_valid_messages(self):
+        dsh = lambda text, **extra: {'type': 'user/message', **extra, 'data': {
+            'role': 'user', 'source': {'kind': 'user'}, 'content': [{'type': 'text', 'text': text}]}}
+        codex = lambda text, **extra: {'type': 'response_item', 'timestamp': '2026-11-05T10:00:00Z', **extra,
+                                       'payload': {'type': 'message', 'role': 'user',
+                                                   'content': [{'type': 'input_text', 'text': text}]}}
+        self.write('.dsh/sessions/w/s.jsonl', encode(
+            {'type': 'session', 'id': 'dsh-1', 'cwd': {'not': 'a string'}},
+            dsh('deepseek valid', time=1793836800000), dsh('deepseek missing time'),
+            dsh('deepseek huge time', time=10 ** 20), dsh('deepseek text time', time='soon'),
+            {'type': 'user/message', 'data': 'not an object', 'time': 1}))
+        self.write('.claude/projects/demo/s.jsonl', encode(
+            claude('claude valid'), claude('claude dict cwd', cwd={'a': 1}),
+            claude('claude list title', type='ai-title', aiTitle=['x']),
+            claude('claude numeric timestamp', timestamp=12345),
+            {'type': 'assistant', 'message': {'role': {'bad': 1}, 'content': 'claude bad role'}},
+            [1, 2], 42, b'{not json\n', b'\xff\xfe\n'))
+        self.write('.codex/sessions/r.jsonl', encode(
+            {'type': 'session_meta', 'payload': {'id': ['bad'], 'cwd': 7}},
+            codex('codex valid'), codex('codex numeric timestamp', timestamp=1.5),
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': 'x'}},
+            {'type': 'response_item', 'payload': 'not an object'}))
+        result = self.sync()
+        self.assertEqual(result['failed'], 0)
+        texts = self.texts()
+        for text in ['deepseek valid', 'deepseek missing time', 'deepseek huge time', 'deepseek text time',
+                     'claude valid', 'claude dict cwd', 'claude numeric timestamp', 'codex valid',
+                     'codex numeric timestamp']:
+            self.assertIn(text, texts)
+        self.assertNotIn('claude bad role', texts)
+        rows = {r['provider']: r for r in self.db.execute('SELECT * FROM sources')}
+        self.assertEqual((rows['deepseek']['native_id'], rows['deepseek']['project']), ('dsh-1', ''))
+        self.assertEqual(rows['claude']['project'], '/projects/demo')
+        self.assertEqual(rows['codex']['native_id'], 'r.jsonl')
+        self.assertIn('Invalid records at lines', rows['claude']['error'])
+        timestamps = dict(self.db.execute('SELECT text,timestamp FROM messages'))
+        self.assertEqual(timestamps['deepseek missing time'], '')
+        self.assertEqual(timestamps['claude numeric timestamp'], '')
+
 
 if __name__ == '__main__':
     unittest.main()

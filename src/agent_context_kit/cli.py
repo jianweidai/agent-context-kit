@@ -100,7 +100,11 @@ def parse(provider, obj):
             body = '\n'.join(c['text'] for c in payload.get('content', [])
                              if isinstance(c, dict) and c.get('type') == 'text' and isinstance(c.get('text'), str))
             if body and role != 'context':
-                message = (role, dt.datetime.fromtimestamp(obj['time'] / 1000, dt.timezone.utc).isoformat(), body)
+                try:
+                    timestamp = dt.datetime.fromtimestamp(obj.get('time') / 1000, dt.timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    timestamp = ''
+                message = (role, timestamp, body)
     elif provider == 'claude':
         if obj.get('sessionId'):
             meta['native_id'] = obj['sessionId']
@@ -213,19 +217,24 @@ def sync_one(db, root, provider, path):
                 try:
                     obj = json.loads(raw)
                     updates, message = parse(provider, obj)
-                except (ValueError, TypeError, AttributeError) as exc:
+                    if message:
+                        role, timestamp, body = message
+                        if not isinstance(role, str) or not isinstance(body, str):
+                            raise TypeError('Non-text message fields')
+                        timestamp = timestamp if isinstance(timestamp, str) else ''
+                except Exception:
+                    # One malformed or unexpected record must not drop the rest of the file.
                     bad_lines.append(line_no)
                     continue
-                meta.update({k: v for k, v in updates.items() if v})
+                meta.update({k: v for k, v in updates.items() if isinstance(v, str) and v})
                 if message:
-                    role, timestamp, body = message
                     db.execute('INSERT INTO messages(source_id,line,role,timestamp,text) VALUES(?,?,?,?,?)',
                                (sid, line_no, role, timestamp, body))
                     count += 1
                     meta['updated_at'] = timestamp or meta['updated_at']
                     if not meta['title'] and role == 'user':
                         meta['title'] = body.replace('\n', ' ')[:160]
-            error = ('Invalid JSON records at lines: ' + str(bad_lines[:20])) if bad_lines else ''
+            error = ('Invalid records at lines: ' + str(bad_lines[:20])) if bad_lines else ''
             db.execute('''UPDATE sources SET native_id=?,project=?,title=?,size=?,mtime=?,offset=?,
                        lines=?,digest=?,available=1,error=?,synced_at=?,updated_at=? WHERE id=?''',
                        (meta['native_id'], meta['project'], meta['title'], stat.st_size, stat.st_mtime_ns,
