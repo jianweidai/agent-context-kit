@@ -38,8 +38,9 @@ class PrivacyTest(unittest.TestCase):
         path.write_bytes(data)
         return path
 
-    def sync(self):
-        return module.sync(self.db, self.root, self.home)
+    def sync(self, redact_secrets=False):
+        # Most tests disable redaction so that removal of verbatim text is observable.
+        return module.sync(self.db, self.root, self.home, redact_secrets)
 
     def texts(self):
         return [r[0] for r in self.db.execute('SELECT text FROM messages ORDER BY source_id,line')]
@@ -86,11 +87,11 @@ class PrivacyTest(unittest.TestCase):
         self.write('.claude/projects/demo/other.jsonl', claude('kept'))
         self.sync()
         path.unlink()
-        result = module.prune(self.db, self.root, self.home)
+        result = module.prune(self.db, self.root, self.home, redact_secrets=False)
         self.assertEqual((result['removed'], result['forgotten'], result['checkpointed']), (1, 1, True))
         self.assertEqual(self.db.execute('SELECT count(*) FROM sources').fetchone()[0], 1)
         self.assertFalse(self.on_disk(SECRET))
-        result = module.prune(self.db, self.root, self.home, rebuild=True)
+        result = module.prune(self.db, self.root, self.home, rebuild=True, redact_secrets=False)
         self.assertEqual((result['rebuilt'], result['unchanged']), (1, 0))
         self.assertEqual(self.texts(), ['kept'])
         self.assertEqual(self.db.execute("SELECT count(*) FROM search WHERE text LIKE '%kept%'").fetchone()[0], 1)
@@ -106,6 +107,56 @@ class PrivacyTest(unittest.TestCase):
         self.assertEqual(self.texts(), [])
         self.assertFalse(self.on_disk(SECRET))
 
+
+    def test_common_secret_formats_are_redacted(self):
+        pem = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----'
+        secrets = {
+            SECRET: 'api-key',
+            'sk-ant-api03-' + 'Ab3' * 30: 'api-key',
+            'sk-' + 'a1B2' * 12: 'api-key',
+            'ghp_' + 'A1b2' * 9: 'github-token',
+            'github_pat_11ABCDEFG0' + 'x1Y2_' * 12: 'github-token',
+            # Fake tokens are assembled at runtime so secret scanners do not flag this file.
+            'AKIA' + 'IOSFODNN7' + 'EXAMPLE': 'aws-access-key',
+            'xox' + 'b-' + '-'.join(['1' * 12, '2' * 13, 'AbCd' * 6]): 'slack-token',
+            pem: 'private-key',
+        }
+        for secret, kind in secrets.items():
+            self.assertEqual(module.redact(f'用这个 {secret}, 好吗'), f'用这个 [REDACTED:{kind}], 好吗', secret)
+        self.assertEqual(module.redact('-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA'), '[REDACTED:private-key]')
+
+    def test_redaction_leaves_ordinary_text_alone(self):
+        ordinary = [
+            'pip install scikit-learn sk-learn', 'see task-scheduler-for-the-release-notes-v2',
+            'risk-assessment-for-quarterly-planning', 'desk-1234567890abcdefghijklmnop',
+            'ghp_short and gho_123', 'ASIAN markets and AKIA prefixes', 'AKIAEXAMPLEPLACEHOLD',
+            'xoxo-gossip-girl-season', 'sk-' + 'abcdef' * 5, '-----BEGIN PUBLIC KEY-----\nMFkwEwYH\n-----END PUBLIC KEY-----',
+            '数据库 sk 重试 retry_count=3', 'commit 9fceb02d0ae598e95dc970b74767f19372d61af8',
+        ]
+        for text in ordinary:
+            self.assertEqual(module.redact(text), text)
+
+    def test_sync_redacts_by_default_and_can_be_disabled(self):
+        self.write('.claude/projects/demo/s.jsonl', claude('key ' + SECRET))
+        self.assertEqual(module.sync(self.db, self.root, self.home)['rebuilt'], 1)
+        self.assertEqual(self.texts(), ['key [REDACTED:api-key]'])
+        self.assertEqual(self.db.execute('SELECT title FROM sources').fetchone()[0], 'key [REDACTED:api-key]')
+        self.assertFalse(self.on_disk(SECRET))
+        module.prune(self.db, self.root, self.home, rebuild=True, redact_secrets=False)
+        self.assertEqual(self.texts(), ['key ' + SECRET])
+
+    def test_index_from_before_redaction_is_reindexed(self):
+        self.write('.claude/projects/demo/s.jsonl', claude('key ' + SECRET))
+        self.sync()
+        with self.db:
+            self.db.execute('PRAGMA user_version=0')
+        self.db.close()
+        self.db = module.connect(self.root)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], module.SCHEMA_VERSION)
+        self.assertEqual(module.sync(self.db, self.root, self.home)['rebuilt'], 1)
+        self.assertEqual(self.texts(), ['key [REDACTED:api-key]'])
+        self.assertFalse(self.on_disk(SECRET))
+        self.assertEqual(module.sync(self.db, self.root, self.home)['unchanged'], 1)
 
 if __name__ == '__main__':
     unittest.main()

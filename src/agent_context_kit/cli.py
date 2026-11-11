@@ -9,8 +9,36 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
+
+
+SCHEMA_VERSION = 1  # 1: message text is redacted on insert.
+
+# (kind, pattern, check): conservative token shapes; `check` rejects look-alikes such as kebab-case names.
+SECRETS = [
+    ('private-key', re.compile(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?'
+                               r'(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\Z)', re.S), None),
+    ('api-key', re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}'),
+     lambda t: re.search(r'[A-Za-z0-9]{20}', t) and re.search(r'[0-9]', t)),
+    ('github-token', re.compile(r'(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})'), None),
+    ('aws-access-key', re.compile(r'(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])'),
+     lambda t: re.search(r'[0-9]', t)),
+    ('slack-token', re.compile(r'(?<![A-Za-z0-9-])xox[abposr]-[A-Za-z0-9-]{10,}'),
+     lambda t: re.search(r'[0-9]', t)),
+]
+
+
+SECRET_HINT = re.compile(r'sk-|gh[pousr]_|github_pat_|AKIA|ASIA|xox[abposr]-|PRIVATE KEY')
+
+
+def redact(text):
+    if not SECRET_HINT.search(text):
+        return text
+    for kind, pattern, check in SECRETS:
+        text = pattern.sub(lambda m: m[0] if check and not check(m[0]) else f'[REDACTED:{kind}]', text)
+    return text
 
 
 def now():
@@ -39,6 +67,7 @@ def connect(root):
     # Deleted messages must not linger in freed pages (see purge/prune).
     db.execute('PRAGMA secure_delete=ON')
     db.execute('PRAGMA journal_mode=WAL')
+    version = db.execute('PRAGMA user_version').fetchone()[0]
     db.executescript('''
     CREATE TABLE IF NOT EXISTS sources (
       id TEXT PRIMARY KEY, provider TEXT, path TEXT UNIQUE, native_id TEXT,
@@ -64,6 +93,12 @@ def connect(root):
         except sqlite3.OperationalError as exc:
             if 'duplicate column' not in str(exc):
                 raise
+    if version < SCHEMA_VERSION:
+        with db:
+            if version < 1:
+                # Text stored before redaction existed is reindexed on the next sync.
+                db.execute("UPDATE sources SET size=-1,mtime=0,offset=0,lines=0,digest='',bad_lines=''")
+            db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
     return db
 
 
@@ -182,7 +217,7 @@ def source_link(root, provider, sid, path):
     return root / 'sources' / provider / (sid + ('.jsonl' + Path(path).suffix if compressed else '.jsonl'))
 
 
-def sync_one(db, root, provider, path):
+def sync_one(db, root, provider, path, redact_secrets=True):
     sid = provider + '-' + hashlib.sha256(str(path).encode()).hexdigest()[:20]
     stat = path.stat()
     row = db.execute('SELECT * FROM sources WHERE id=?', (sid,)).fetchone()
@@ -239,11 +274,15 @@ def sync_one(db, root, provider, path):
                         if not isinstance(role, str) or not isinstance(body, str):
                             raise TypeError('Non-text message fields')
                         timestamp = timestamp if isinstance(timestamp, str) else ''
+                        if redact_secrets:
+                            body = redact(body)
                 except Exception:
                     # One malformed or unexpected record must not drop the rest of the file.
                     bad_lines.append(line_no)
                     continue
                 meta.update({k: v for k, v in updates.items() if isinstance(v, str) and v})
+                if redact_secrets and 'title' in updates:
+                    meta['title'] = redact(meta['title'])
                 if message:
                     db.execute('INSERT INTO messages(source_id,line,role,timestamp,text) VALUES(?,?,?,?,?)',
                                (sid, line_no, role, timestamp, body))
@@ -305,18 +344,19 @@ def purge(db, root, found):
     return removed
 
 
-def _sync(db, root, home):
+def _sync(db, root, home, redact_secrets=True):
     counts = {'unchanged': 0, 'appended': 0, 'rebuilt': 0, 'updated': 0, 'failed': 0, 'messages_added': 0}
     found = set()
     for provider, path in discover(home):
         found.add(str(path))
         with db:
-            kind, added = sync_one(db, root, provider, path)
+            kind, added = sync_one(db, root, provider, path, redact_secrets)
         counts[kind] += 1
         counts['messages_added'] += added
     with db:
         counts['removed'] = purge(db, root, found)
-    if counts['removed']:
+    if counts['removed'] or counts['rebuilt']:
+        # Rebuilt and removed sources leave their old text in WAL frames until a checkpoint.
         checkpoint(db, 1000)
     counts['memory_mappings'] = map_memories(home, root)
     catalog = root / 'catalog.jsonl.tmp'
@@ -328,18 +368,18 @@ def _sync(db, root, home):
     return counts
 
 
-def sync(db, root, home):
+def sync(db, root, home, redact_secrets=True):
     with sync_lock(root):
-        return _sync(db, root, home)
+        return _sync(db, root, home, redact_secrets)
 
 
-def prune(db, root, home, rebuild=False):
+def prune(db, root, home, rebuild=False, redact_secrets=True):
     """Sync, forget missing sources entirely, then compact the index and WAL."""
     with sync_lock(root):
         if rebuild:
             with db:
                 db.execute("UPDATE sources SET size=-1,mtime=0,offset=0,lines=0,digest='',bad_lines=''")
-        counts = _sync(db, root, home)
+        counts = _sync(db, root, home, redact_secrets)
         with db:
             counts['forgotten'] = db.execute('DELETE FROM sources WHERE available=0').rowcount
             db.execute("INSERT INTO search(search) VALUES('optimize')")
@@ -364,6 +404,8 @@ def main():
     parser.add_argument('--root', type=Path, default=Path.home() / '.agent-context-kit')
     parser.add_argument('--source-home', type=Path, default=Path.home())
     parser.add_argument('--no-sync', action='store_true', help='Read the existing index without refreshing')
+    parser.add_argument('--no-redact', action='store_true',
+                        help='Index secrets verbatim (also AGENT_CONTEXT_REDACT=0); run prune --rebuild after changing')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('sync')
     p = sub.add_parser('prune', help='Forget deleted sources, then compact the index (FTS optimize, VACUUM)')
@@ -393,16 +435,17 @@ def main():
     root, home = args.root.expanduser().absolute(), args.source_home.expanduser().absolute()
     os.umask(0o077)
     db = connect(root)
+    redact_secrets = not args.no_redact and os.environ.get('AGENT_CONTEXT_REDACT', '1') != '0'
     if args.command == 'sync':
-        result = sync(db, root, home)
+        result = sync(db, root, home, redact_secrets)
         output(result)
         return 1 if result['failed'] else 0
     if args.command == 'prune':
-        result = prune(db, root, home, args.rebuild)
+        result = prune(db, root, home, args.rebuild, redact_secrets)
         output(result)
         return 1 if result['failed'] else 0
     if not args.no_sync:
-        sync(db, root, home)
+        sync(db, root, home, redact_secrets)
     if args.command == 'status':
         output({'root': str(root), 'sources': [dict(r) for r in db.execute('''SELECT provider,
           available, count(*) count, sum(error!='') errors FROM sources GROUP BY provider,available''')],
