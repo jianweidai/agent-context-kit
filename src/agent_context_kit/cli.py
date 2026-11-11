@@ -330,8 +330,9 @@ def main():
                 'sessions': [dict(r) for r in rows]})
     elif args.command == 'search':
         where, values = filters(args)
-        # LIKE accelerates >=3-character substrings with the trigram index; instr ensures literal semantics.
-        if len(args.query) >= 3 and not any(c in args.query for c in '%_\\'):
+        # LIKE accelerates >=3-character substrings with the trigram index. Wildcards (%, _) only widen
+        # the candidate set and LIKE has no default escape character; instr ensures literal semantics.
+        if len(args.query) >= 3:
             where.append('m.id IN (SELECT rowid FROM search WHERE text LIKE ?)')
             values.append('%' + args.query + '%')
         where.append('instr(lower(m.text),lower(?))>0')

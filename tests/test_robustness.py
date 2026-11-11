@@ -1,0 +1,83 @@
+import contextlib
+import io
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+from agent_context_kit import cli as module
+
+
+def claude(text, **extra):
+    obj = {'type': 'user', 'sessionId': 'native-1', 'cwd': '/projects/demo',
+           'timestamp': '2026-11-05T10:00:00Z', 'message': {'role': 'user', 'content': text}}
+    obj.update(extra)
+    return obj
+
+
+def encode(*records):
+    return b''.join(r if isinstance(r, bytes) else (json.dumps(r, ensure_ascii=False) + '\n').encode()
+                    for r in records)
+
+
+class RobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home = Path(self.temp.name) / 'home'
+        self.root = Path(self.temp.name) / 'context'
+        self.db = module.connect(self.root)
+
+    def tearDown(self):
+        self.db.close()
+        self.temp.cleanup()
+
+    def write(self, relative, data):
+        path = self.home / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def sync(self):
+        return module.sync(self.db, self.root, self.home)
+
+    def texts(self):
+        return [r[0] for r in self.db.execute('SELECT text FROM messages ORDER BY source_id,line')]
+
+    def search(self, query):
+        """Run the CLI in-process and capture every SQL statement it executes."""
+        statements, connect = [], module.connect
+
+        def traced(root):
+            db = connect(root)
+            db.set_trace_callback(statements.append)
+            return db
+        argv = ['agent-context', '--root', str(self.root), '--source-home', str(self.home),
+                '--no-sync', 'search', query]
+        out = io.StringIO()
+        with mock.patch.object(module, 'connect', traced), mock.patch.object(sys, 'argv', argv), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(module.main(), 0)
+        used_index = any('FROM search WHERE text LIKE' in s for s in statements)
+        return [r['snippet'] for r in json.loads(out.getvalue())['results']], used_index
+
+    def test_wildcard_characters_use_index_and_stay_literal(self):
+        self.write('.claude/projects/demo/s.jsonl', encode(
+            claude('set retry_count=3'), claude('set retryXcount=4'),
+            claude('rate 100% done'), claude('rate 1000 done'),
+            claude(r'path C:\temp\new'), claude('path C:/temp/new')))
+        self.sync()
+        for query, expected in [('retry_count', 'retry_count=3'), ('100%', '100% done'),
+                                (r'C:\temp', r'C:\temp\new'), ('RETRY_COUNT', 'retry_count=3')]:
+            snippets, used_index = self.search(query)
+            self.assertTrue(used_index, query)
+            self.assertEqual(len(snippets), 1, (query, snippets))
+            self.assertIn(expected, snippets[0])
+        snippets, used_index = self.search('t_')
+        self.assertFalse(used_index)
+        self.assertEqual(len(snippets), 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
