@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -96,6 +97,37 @@ class PrivacyTest(unittest.TestCase):
         self.assertEqual(self.texts(), ['kept'])
         self.assertEqual(self.db.execute("SELECT count(*) FROM search WHERE text LIKE '%kept%'").fetchone()[0], 1)
 
+    @unittest.skipIf(sqlite3.sqlite_version_info < (3, 42), 'FTS5 secure-delete needs SQLite 3.42')
+    def test_deleted_source_leaves_no_trigrams(self):
+        path = self.write('.claude/projects/demo/s.jsonl', claude('marker zqxjkvwpy'))
+        self.write('.claude/projects/demo/other.jsonl', claude('kept'))
+        self.sync()
+        self.assertTrue(self.on_disk('zqx'))
+        path.unlink()
+        self.sync()
+        self.assertEqual([g for g in ('zqx', 'qxj', 'xjk', 'jkv', 'kvw', 'vwp', 'wpy') if self.on_disk(g)], [])
+
+    def test_missing_source_directory_keeps_text_until_prune(self):
+        self.write('.claude/projects/demo/s.jsonl', claude('claude text'))
+        self.write('.codex/sessions/2026/rollout.jsonl', codex('codex text'))
+        self.sync()
+        sessions = self.home / '.codex/sessions'
+        sessions.rename(self.home / '.codex/away')
+        self.assertEqual(self.sync()['removed'], 0)
+        self.assertEqual(self.texts(), ['claude text', 'codex text'])
+        self.assertEqual(self.db.execute("SELECT available FROM sources WHERE provider='codex'").fetchone()[0], 0)
+        (self.home / '.codex/away').rename(sessions)
+        result = self.sync()
+        self.assertEqual((result['unchanged'], result['rebuilt']), (2, 0))
+        # Another home hides every source without discarding its text; prune then forgets them.
+        other = Path(self.temp.name) / 'other'
+        other.mkdir()
+        self.assertEqual(module.sync(self.db, self.root, other, False)['removed'], 0)
+        self.assertEqual(len(self.texts()), 2)
+        self.assertEqual(module.prune(self.db, self.root, other, redact_secrets=False)['forgotten'], 2)
+        self.assertEqual(self.texts(), [])
+        self.assertFalse(self.on_disk('codex text'))
+
     def test_legacy_rows_of_missing_sources_are_purged(self):
         path = self.write('.claude/projects/demo/s.jsonl', claude('legacy ' + SECRET))
         self.sync()
@@ -124,6 +156,25 @@ class PrivacyTest(unittest.TestCase):
         for secret, kind in secrets.items():
             self.assertEqual(module.redact(f'用这个 {secret}, 好吗'), f'用这个 [REDACTED:{kind}], 好吗', secret)
         self.assertEqual(module.redact('-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA'), '[REDACTED:private-key]')
+
+    def test_private_key_redaction_stops_at_key_material(self):
+        begin, end = '-----BEGIN RSA PRIVATE KEY-----', '-----END RSA PRIVATE KEY-----'
+        body = 'MIIEpAIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo\n4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onL\nQw=='
+        cases = {
+            f'The file starts with {begin} and then base64. DECISION: use three retries.':
+                'The file starts with [REDACTED:private-key] and then base64. DECISION: use three retries.',
+            f'{begin}\n{body}\n{end}\nkeep this': '[REDACTED:private-key]\nkeep this',
+            f'{begin}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,0123ABCD\n\n{body}\n{end} ok':
+                '[REDACTED:private-key] ok',
+            # Line breaks escaped inside quoted JSON.
+            '{"key": "' + f'{begin}\n{body}\n{end}'.replace('\n', '\\n') + '"}': '{"key": "[REDACTED:private-key]"}',
+            f'{begin}\nMIIEpAIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo\n\nnext paragraph about retries':
+                '[REDACTED:private-key]\n\nnext paragraph about retries',
+            f'starts with {begin}, ends with {end}. Unrelated text between markers stays.':
+                f'starts with [REDACTED:private-key], ends with {end}. Unrelated text between markers stays.',
+        }
+        for text, expected in cases.items():
+            self.assertEqual(module.redact(text), expected)
 
     def test_redaction_leaves_ordinary_text_alone(self):
         ordinary = [

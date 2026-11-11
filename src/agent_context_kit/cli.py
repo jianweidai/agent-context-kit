@@ -24,9 +24,14 @@ MAX_SPELLINGS = 16  # trigram phrases tried for case variants the tokenizer does
 TAIL_SETTLE_SECONDS = 600  # an unterminated last line is indexed once the file has been idle this long
 
 # (kind, pattern, check): conservative token shapes; `check` rejects look-alikes such as kebab-case names.
+# After BEGIN only key material is consumed (base64 runs, PEM encryption headers, real or escaped line
+# breaks), so prose that merely mentions the marker stays searchable. A truncated key loses its full lines.
+PEM_BREAK = r'(?:\s|\\[nr])*'
 SECRETS = [
-    ('private-key', re.compile(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?'
-                               r'(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\Z)', re.S), None),
+    ('private-key', re.compile(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----'
+                               r'(?:' + PEM_BREAK + r'(?:[A-Za-z0-9+/=]{16,}|(?:Proc-Type|DEK-Info):[^\n\\]*))*'
+                               r'(?:' + PEM_BREAK + r'[A-Za-z0-9+/=]{0,15}' + PEM_BREAK +
+                               r'-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)?'), None),
     ('api-key', re.compile(r'(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}'),
      lambda t: re.search(r'[A-Za-z0-9]{20}', t) and re.search(r'[0-9]', t)),
     ('github-token', re.compile(r'(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})'), None),
@@ -140,6 +145,15 @@ def connect(root):
     CREATE TRIGGER IF NOT EXISTS message_delete AFTER DELETE ON messages BEGIN
       INSERT INTO search(search,rowid,text) VALUES('delete',old.id,old.text); END;
     ''')
+    # PRAGMA secure_delete does not reach FTS5 segments, which would keep the trigrams of deleted text
+    # until a merge. The option is stored in the index; SQLite before 3.42 lacks it and relies on prune.
+    if sqlite3.sqlite_version_info >= (3, 42) and not db.execute(
+            "SELECT 1 FROM search_config WHERE k='secure-delete' AND v").fetchone():
+        try:
+            db.execute("INSERT INTO search(search,rank) VALUES('secure-delete',1)")
+            db.commit()
+        except sqlite3.OperationalError:
+            db.rollback()
     # Indexes created before bad_lines existed; their errored sources are retried once.
     if 'bad_lines' not in {r['name'] for r in db.execute('PRAGMA table_info(sources)')}:
         try:
@@ -231,11 +245,12 @@ def parse(provider, obj):
     return meta, message
 
 
+SOURCE_DIRS = [('claude', '.claude/projects'), ('codex', '.codex/sessions'),
+               ('codex', '.codex/archived_sessions'), ('deepseek', '.dsh/sessions')]
+
+
 def discover(home):
-    for provider, directory in [('claude', '.claude/projects'),
-                                ('codex', '.codex/sessions'),
-                                ('codex', '.codex/archived_sessions'),
-                                ('deepseek', '.dsh/sessions')]:
+    for provider, directory in SOURCE_DIRS:
         root = home / directory
         if root.exists():
             for path in sorted(root.rglob('*')):
@@ -395,11 +410,19 @@ def checkpoint(db, wait_ms):
         db.execute('PRAGMA busy_timeout=60000')
 
 
-def purge(db, root, found):
-    """Remove indexed text and links of sources whose files are gone; keep the row for `read` errors."""
+def purge(db, root, home, found):
+    """Remove indexed text and links of sources whose files are gone; keep the row for `read` errors.
+
+    A file counts as gone only below a source directory that is present. Sources of a missing directory
+    (unmounted volume, another --source-home) are just marked unavailable, so they return without a
+    reindex; `prune` forgets them."""
+    present = tuple(str(home / d) + os.sep for _, d in SOURCE_DIRS if (home / d).is_dir())
     removed = 0
     for row in db.execute('SELECT id,provider,path,available FROM sources').fetchall():
         if row['path'] in found:
+            continue
+        if not row['path'].startswith(present):
+            db.execute('UPDATE sources SET available=0 WHERE id=?', (row['id'],))
             continue
         stale_link = source_link(root, row['provider'], row['id'], row['path'])
         if stale_link.is_symlink():
@@ -417,6 +440,14 @@ def purge(db, root, found):
     return removed
 
 
+def write_catalog(db, root):
+    catalog = root / 'catalog.jsonl.tmp'
+    with catalog.open('w') as f:
+        for row in db.execute('SELECT id,provider,native_id,project,title,path,available,error,updated_at FROM sources ORDER BY updated_at DESC,id'):
+            f.write(json.dumps(dict(row), ensure_ascii=False) + '\n')
+    catalog.replace(root / 'catalog.jsonl')
+
+
 def _sync(db, root, home, redact_secrets=True):
     counts = {'unchanged': 0, 'appended': 0, 'rebuilt': 0, 'updated': 0, 'failed': 0, 'messages_added': 0}
     found = set()
@@ -427,16 +458,12 @@ def _sync(db, root, home, redact_secrets=True):
         counts[kind] += 1
         counts['messages_added'] += added
     with db:
-        counts['removed'] = purge(db, root, found)
+        counts['removed'] = purge(db, root, home, found)
     if counts['removed'] or counts['rebuilt']:
         # Rebuilt and removed sources leave their old text in WAL frames until a checkpoint.
         checkpoint(db, 1000)
     counts['memory_mappings'] = map_memories(home, root)
-    catalog = root / 'catalog.jsonl.tmp'
-    with catalog.open('w') as f:
-        for row in db.execute('SELECT id,provider,native_id,project,title,path,available,error,updated_at FROM sources ORDER BY updated_at DESC,id'):
-            f.write(json.dumps(dict(row), ensure_ascii=False) + '\n')
-    catalog.replace(root / 'catalog.jsonl')
+    write_catalog(db, root)
     (root / 'last-sync.json').write_text(json.dumps({'at': now(), **counts}, indent=2) + '\n')
     return counts
 
@@ -455,8 +482,10 @@ def prune(db, root, home, rebuild=False, redact_secrets=True):
                 db.execute("UPDATE sources SET size=-1,mtime=0,offset=0,lines=0,digest='',bad_lines=''")
         counts = _sync(db, root, home, redact_secrets)
         with db:
+            db.execute('DELETE FROM messages WHERE source_id IN (SELECT id FROM sources WHERE available=0)')
             counts['forgotten'] = db.execute('DELETE FROM sources WHERE available=0').rowcount
             db.execute("INSERT INTO search(search) VALUES('optimize')")
+        write_catalog(db, root)
         db.execute('VACUUM')
         counts['checkpointed'] = checkpoint(db, 60000)
     return counts
